@@ -48,8 +48,8 @@ DRY_RUN=false
 
 # Define container/VM relationships
 NAS_CTID=103
-NAS_DEPENDENT_CTS=(101 102 105)
-NAS_INDEPENDENT_CTS=(104)
+NAS_DEPENDENT_CTS=(101 102)
+NAS_INDEPENDENT_CTS=(104 106 107)
 NAS_INDEPENDENT_VMS=(100)
 
 # Files or directories to include in backup of PVE config
@@ -63,7 +63,8 @@ PVE_BACKUP_LIST=(
   "/etc/resolv.conf"
   "/etc/nut"
   "/etc/postfix"
-  "/root/.config/rclone/rclone.conf"
+  "/root/.config/rclone/rclone.conf",
+  "/usr/local/bin"
 )
 
 
@@ -254,6 +255,14 @@ backup_pve_config() {
   
   mkdir -p "$work_dir"
 
+  # Copy all VM/CT configs from /etc/pve to the working directory. While these are already 
+  # included in the backup set by copying /etc/pve, this makes them easy to view on a Windows
+  # machine, which is unable to extract them because of the symbolic links.
+  mkdir -p "$work_dir/pve-configs"
+  cp /etc/pve/nodes/server/qemu-server/*.conf "$work_dir/pve-configs/"
+  cp /etc/pve/nodes/server/lxc/*.conf "$work_dir/pve-configs/"
+
+  # Copy all specified files/directories to the temporary backup directory, preserving structure
   for path in "${PVE_BACKUP_LIST[@]}"; do
     [ -e "$path" ] && cp --parents --recursive "$path" "$work_dir"
   done
@@ -340,11 +349,12 @@ prune_local_backups() {
     done
   fi
 
-  # Step 2: Prune orphaned .log files (that don't have a matching .zst)
+  # Step 2: Prune orphaned .log files (that don't have a matching backup file)
   if ! $DRY_RUN; then
     while IFS= read -r log_file; do
-      local zst_file="${log_file%.log}.zst"
-      if [[ ! -f "$zst_file" ]]; then
+      local base="${log_file%.log}"
+      # Check for either .tar.zst (containers/PVE) or .vma.zst (VMs)
+      if [[ ! ( -f "${base}.tar.zst" || -f "${base}.vma.zst" ) ]]; then
         log "  Deleting orphaned log: $log_file"
         rm -f "$log_file"
       fi
@@ -425,6 +435,9 @@ log "Starting backup...\n"
 
 # NAS container Backup
 if should_backup "$NAS_CTID"; then
+  # Shutdown dependent containers first to prevent issues with stopping the NAS container
+  # while they are still running. These will be restarted in the "Containers" loop after
+  # the NAS container is backed up and restarted.
   for ctid in "${NAS_DEPENDENT_CTS[@]}"; do
     if container_is_running "$ctid"; then
       stop_container "$ctid"
@@ -433,9 +446,10 @@ if should_backup "$NAS_CTID"; then
 
   stop_container "$NAS_CTID"
   backup_and_restart_nas_container "$NAS_CTID"
-
-  process_latest_backup "vzdump-lxc-${NAS_CTID}"
 fi
+
+# Always include the NAS container's latest backup in the sync set.
+process_latest_backup "vzdump-lxc-${NAS_CTID}"
 
 # Containers
 #
